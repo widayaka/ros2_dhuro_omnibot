@@ -1,2 +1,2 @@
-**ROS2 Dhuro Omnibot Package**
-Introduction
+# ROS2 Dhuro Omnibot - Omnidirectional Mobile Robot
+## Introduction
