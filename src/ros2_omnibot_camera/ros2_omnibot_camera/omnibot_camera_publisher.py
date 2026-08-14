@@ -13,20 +13,23 @@ class camera_publisher(Node):
         super().__init__('camera_publisher_node')
 
         self.camera_device_num = 0
-        self.camera_width = 640
-        self.camera_height = 480
+        self.camera_width = 480
+        self.camera_height = 360
 
         self.camera = cv2.VideoCapture(self.camera_device_num)
         
         self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.camera_width)
         self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.camera_height)
+        self.camera.set(cv2.CAP_PROP_FPS, 30)
+        self.camera.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+        self.camera.set(cv2.CAP_PROP_FOCUS, 0)
         
         self.bridge_object = CvBridge()
         
-        self.queue_size = 20
-        self.communication_period = 0.02
+        self.queue_size = 10
+        self.communication_period = 0.01
 
-        self.camera_topic_name = '/omnibot_camera'
+        self.camera_topic_name = '/camera/omnibot_camera_raw'
         self.camera_publisher = self.create_publisher(Image, self.camera_topic_name, self.queue_size)
         self.camera_timer = self.create_timer(self.communication_period, self.cameraCallbackFunction)
 

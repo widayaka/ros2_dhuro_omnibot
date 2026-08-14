@@ -7,15 +7,8 @@ import serial
 import matplotlib.pyplot as plt
 import numpy as np
 import os
-import threading
 
 from rclpy.node import Node
-from rclpy.qos import (
-    QoSProfile,
-    ReliabilityPolicy,
-    HistoryPolicy,
-    DurabilityPolicy
-)
 
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
@@ -30,30 +23,25 @@ class object_tracking_aruco(Node):
 
         self.COMPort = '/dev/serial/by-id/usb-1a86_USB2.0-Serial-if00-port0'
         self.Baudrate = 115200
-
-        # self.serial_to_robot = serial.Serial(self.COMPort, self.Baudrate, timeout=0.1)
-
         self.serial_to_robot = None
         self.connect_serial()
 
-        self.queue_size = 20
-        self.communication_period = 0.02
-        self.camera_processing_rate = 100.0
-
-        camera_qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1, reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.VOLATILE)
+        self.queue_size = 10
+        self.communication_period = 0.01
+        self.camera_processing_rate = 30.0
 
         self.latest_frame = None 
-        self.frame_lock = threading.Lock()
         self.new_frame_available = False
 
-        self.camera_sub_topic_name = '/omnibot_camera'
-        self.camera_subscriber = self.create_subscription(Image, self.camera_sub_topic_name, self.cameraSubCallbackFunction, camera_qos)
+        self.camera_sub_topic_name = '/camera/omnibot_camera_raw'
+        self.camera_subscriber = self.create_subscription(Image, self.camera_sub_topic_name, self.cameraSubscriberCallbackFunction, self.queue_size)
 
         self.aruco_pub_topic_name = '/aruco_pose_estimation'
         self.aruco_publisher = self.create_publisher(Float32MultiArray, self.aruco_pub_topic_name, self.queue_size)
 
-        self.processing_timer = self.create_timer(1.0 / self.camera_processing_rate, self.processLatestFrame)
-        self.timer_callback = self.create_timer(self.communication_period, self.publisherCallbackFunction)
+        # self.camera_processing_timer = self.create_timer(1.0 / self.camera_processing_rate, self.cameraProcessingCallbackFunction)
+        self.camera_processing_timer = self.create_timer(self.communication_period, self.cameraProcessingCallbackFunction)
+        self.publisher_timer = self.create_timer(self.communication_period, self.publisherCallbackFunction)
         self.serial_timer = self.create_timer(self.communication_period, self.serialCallbackFunction)
 
         self.aruco_dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_7X7_50)
@@ -73,6 +61,8 @@ class object_tracking_aruco(Node):
         self.marker_size = 0.10
         self.target_ids = [0, 1, 2, 3, 4, 5]
 
+        self.frame_RGB = None
+
         self.aruco_id = 0
         self.marker_x = 0.0
         self.marker_y = 0.0
@@ -91,15 +81,21 @@ class object_tracking_aruco(Node):
 
         self.aruco_detection_flag = False
 
-        self.x_error = 0.0
-        self.y_error = 0.0
-        self.z_error = 0.0
-        self.yaw_error = 0.0
-
         self.x_setpoint = 0.0
         self.y_setpoint = 0.0
         self.z_setpoint = 0.25
+
+        self.x_error = 0.0
+        self.y_error = 0.0
+        self.z_error = 0.0
+
+        self.roll_setpoint = 0.0
+        self.pitch_setpoint = 0.0
         self.yaw_setpoint = 0.0
+
+        self.roll_error = 0.0
+        self.pitch_error = 0.0
+        self.yaw_error = 0.0
 
         self.center_frame_x = 0
         self.center_frame_y = 0
@@ -108,7 +104,6 @@ class object_tracking_aruco(Node):
 
         self.x_ref_z = 0.30
         self.x_z_compensation = 0.20
-
         self.hold_timeout = 0.25
         
         self.time_now = 0
@@ -122,24 +117,21 @@ class object_tracking_aruco(Node):
         self.commandToSend = '*10,0,0,0,0,0,0#'
         
         # Konfigurasi parameter PID -> kpx, kix, kdx, kpz, kiz, kdz, kpyaw, kiyaw, kdyaw
-        self.PID = PIDControllerModule(0.05, 0.0, 0.05, 0.0, 0.0, 0.0, 1.0, 0.0, 0.05)
+        self.PID = PIDControllerModule(0.025, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.05)
         
         self.start_time = time.time()
         self.time_log = []
-
         self.x_setpoint_log = []
         self.x_error_log = []
-
         self.z_setpoint_log = []
         self.z_error_log = []
-        
         self.yaw_setpoint_log = []
         self.yaw_error_log = []
 
         self.aruco_flag_name = 'ArUco Marker ID:'
         self.aruco_status_name = 'ArUco Status:'
         self.aruco_status_detected = 'Detected'
-        self.aruco_status_undetected = 'Not Detected'
+        self.aruco_status_undetected = 'None'
 
         self.error_x_name = 'ArUco Error X:'
         self.error_y_name = 'ArUco Error Y:'
@@ -148,125 +140,60 @@ class object_tracking_aruco(Node):
 
         self.processing_times = {}
     
-    def cameraSubCallbackFunction(self, msg):
+    def cameraSubscriberCallbackFunction(self, message):
         try:
-            frame = self.bridge_object.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            image = self.bridge_object.imgmsg_to_cv2(message, desired_encoding='bgr8')
+            self.frame_RGB = image
 
         except Exception as e:
-            self.get_logger().error(f"CV Bridge Error: {e}")
+            self.get_logger().error(f"Subscriber failed load image: {e}")
             return
 
-        with self.frame_lock:
-            self.latest_frame = frame
-            self.new_frame_available = True
-
-    def processLatestFrame(self):
-        process_start = time.perf_counter()
-
-        step_start = time.perf_counter()
-        with self.frame_lock:
-            if (self.latest_frame is None or not self.new_frame_available):
-                return
-            frame = self.latest_frame
-            self.new_frame_available = False
-        step_start = self.measure_time("Frame", step_start)
-
-        step_two = time.perf_counter()
-        current_time = time.monotonic()
-        if self.previous_frame_time is not None:
-            dt = current_time - self.previous_frame_time
-            
-            if dt > 0.0:
-                instantaneous_fps = 1.0 / dt
-                
-                if self.frame_per_second == 0.0:
-                    self.frame_per_second = instantaneous_fps
-
-                else:
-                    self.frame_per_second = (self.fps_alpha * instantaneous_fps + (1.0 - self.fps_alpha) * self.frame_per_second)
+    def cameraProcessingCallbackFunction(self):
+        if self.frame_RGB is None:
+            return
         
-        self.previous_frame_time = current_time
-        step_two = self.measure_time("FPS Calc", step_two)
-
-        step_three = time.perf_counter()
+        frame = self.frame_RGB.copy()
         self.frame_width = frame.shape[1]
         self.frame_height = frame.shape[0]
         
-        self.center_frame_x = (int)(self.frame_width/2)
-        self.center_frame_y = (int)(self.frame_height/2)
-        
+        self.center_frame_x = (int)(self.frame_width / 2)
+        self.center_frame_y = (int)(self.frame_height / 2)
         self.center_frame = (self.center_frame_x, self.center_frame_y)
 
         frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        step_three = self.measure_time("Gray", step_three)
-        
-        step_four = time.perf_counter()
+
         self.aruco_detection_flag = False
         corners, ids, _ = self.aruco_detector.detectMarkers(frame_gray)
-        step_four = self.measure_time("Aruco Detection", step_four)
         
-        step_five = time.perf_counter()
         if ids is not None:
-            
             cv2.aruco.drawDetectedMarkers(frame, corners, ids)
             rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(corners, self.marker_size, self.camera_matrix, self.dist_coeffs)
-            selected_index = None 
-            selected_id = None
-            step_five = self.measure_time("Pose Estimation", step_five)
             
-            step_six = time.perf_counter()
             for i, marker_id, in enumerate(ids.flatten()):
                 marker_id = int(marker_id)
+
                 if marker_id in self.target_ids:
-                    selected_index = i
-                    selected_id = marker_id
-            step_six = self.measure_time("Marker Selection", step_six)
+                    self.aruco_detection_flag = True
+                    self.aruco_id = marker_id
 
-            step_seven = time.perf_counter()
-            if selected_index is not None:
-                
-                i = selected_index
-                marker_id = selected_id
+                    points = corners[i][0]
+                    self.center_aruco_x = int(np.mean(points[:,0]))
+                    self.center_aruco_y = int(np.mean(points[:,1]))
+                    x, y, z, = tvecs[i][0]
+                    x = x - 0.01
+                    R, _ = cv2.Rodrigues(rvecs[i])
 
-                points = corners[i][0]
-                self.center_aruco_x = int(np.mean(points[:,0]))
-                self.center_aruco_y = int(np.mean(points[:,1]))
-                x, y, z, = tvecs[i][0]
-                R, _ = cv2.Rodrigues(rvecs[i])
-                yaw_raw = np.degrees(np.arctan2(-R[2, 0], R[0, 0]))
+                    roll = np.degrees(np.arctan2(R[2, 1], R[2, 2]))
+                    pitch = np.degrees(np.arctan2(-R[2, 0],np.sqrt(R[2, 1]**2 + R[2, 2]**2)))
+                    yaw = np.degrees(np.arctan2(R[1, 0],R[0, 0]))
 
-                x -= self.x_offset
-                y -= self.y_offset
-                z -= self.z_offset
+                    self.x_error = round(self.x_setpoint - x, 4)
+                    self.y_error = round(self.y_setpoint - y, 4)
+                    self.z_error = round(self.z_setpoint - z, 4)
 
-                x = x - ((z - self.x_ref_z) * self.x_z_compensation)
-                alpha = 0.6
-                step_seven = self.measure_time("Pose Calculation", step_seven)
-                
-                step_eight = time.perf_counter()
-                self.marker_x = alpha * x + (1 - alpha) * self.prev_x
-                self.marker_y = alpha * y + (1 - alpha) * self.prev_y
-                self.marker_z = alpha * z + (1 - alpha) * self.prev_z
-                self.marker_yaw = alpha * yaw_raw + (1 - alpha) * self.prev_yaw
+                    self.yaw_error = self.yaw_setpoint - yaw
 
-                self.aruco_id = marker_id
-                self.prev_id = marker_id
-                self.prev_x = self.marker_x
-                self.prev_y = self.marker_y
-                self.prev_z = self.marker_z
-                self.prev_yaw = self.marker_yaw
-                self.last_seen_time = time.monotonic()
-
-                self.x_error = self.center_frame_x - self.center_aruco_x
-                self.y_error = self.center_frame_y - self.center_aruco_y
-                self.z_error = self.z_setpoint - self.marker_z
-                self.yaw_error = self.yaw_setpoint - yaw_raw
-
-                # self.z_error = round(self.z_error, 2)
-                # self.yaw_error = round(self.yaw_error, 2)
-
-                self.aruco_detection_flag = True
-                step_eight = self.measure_time("Error Calculation", step_eight)
                     # current_time = time.time() - self.start_time
                     # self.time_log.append(current_time)
                     # self.x_setpoint_log.append(0)
@@ -274,82 +201,81 @@ class object_tracking_aruco(Node):
                     # self.z_setpoint_log.append(0)
                     # self.z_error_log.append(self.z_error)
 
-                step_nine = time.perf_counter()
-                    # cv2.drawFrameAxes(frame_RGB_copy, self.camera_matrix, self.dist_coeffs, rvecs[i], tvecs[i], 0.05)
-                cv2.circle(frame,(self.center_aruco_x, self.center_aruco_y), 5, (0, 0, 255), -1)
-                cv2.circle(frame,(self.center_frame_x, self.center_frame_y), 5, (0, 0, 255), -1)                    
-                cv2.line(frame, (self.center_frame_x, self.center_frame_y), (self.center_aruco_x, self.center_aruco_y), (255, 255, 255), 1, cv2.LINE_AA)
-                    # cv2.putText(frame_RGB_copy, str(marker_id), (150, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
-                    # cv2.putText(frame_RGB_copy, self.aruco_status_detected, (150, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
-                    # cv2.putText(frame_RGB_copy, str(self.x_error), (150, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
-                    # cv2.putText(frame_RGB_copy, str(self.y_error), (150, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
-                    # cv2.putText(frame_RGB_copy, str(self.z_error), (150, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
-                    # cv2.putText(frame_RGB_copy, str(self.yaw_error), (150, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
+                    cv2.drawFrameAxes(frame, self.camera_matrix, self.dist_coeffs, rvecs[i], tvecs[i], 0.05)
+                    cv2.circle(frame,(self.center_aruco_x, self.center_aruco_y), 5, (0, 0, 255), -1)
+                    cv2.circle(frame,(self.center_frame_x, self.center_frame_y), 5, (0, 0, 255), -1)                    
+                    cv2.line(frame,  (self.center_frame_x, self.center_frame_y), (self.center_aruco_x, self.center_aruco_y), (255, 255, 255), 1, cv2.LINE_AA)
+                    
+                    cv2.putText(frame, str(marker_id),    (100, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
+                    cv2.putText(frame, str(self.x_error), (100, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
+                    cv2.putText(frame, str(self.y_error), (100, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
+                    cv2.putText(frame, str(self.z_error), (100, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
+                    
+                    cv2.putText(frame, f"{x:.4f}",  (45,  self.frame_height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
+                    cv2.putText(frame, f"{y:.4f}",  (145, self.frame_height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
+                    cv2.putText(frame, f"{z:.4f}",  (245, self.frame_height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
 
-                cv2.drawFrameAxes(frame, self.camera_matrix, self.dist_coeffs, rvecs[i], tvecs[i], 0.05)
-                step_nine = self.measure_time("Drawing", step_nine)
+                    cv2.putText(frame, f"{roll:.2f}",  (35,  self.frame_height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
+                    cv2.putText(frame, f"{pitch:.2f}", (145, self.frame_height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
+                    cv2.putText(frame, f"{yaw:.2f}",   (235, self.frame_height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
 
         if not self.aruco_detection_flag:
-            # cv2.putText(frame_RGB_copy, str("no IDs"), (150, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
-            # cv2.putText(frame_RGB_copy, self.aruco_status_undetected, (150, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
-            # cv2.putText(frame_RGB_copy, self.aruco_status_undetected, (150, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
-            # cv2.putText(frame_RGB_copy, self.aruco_status_undetected, (150, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
-            # cv2.putText(frame_RGB_copy, self.aruco_status_undetected, (150, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
-            # cv2.putText(frame_RGB_copy, self.aruco_status_undetected, (150, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
-            elapsed = (time.monotonic() - self.last_seen_time)
+            self.aruco_id = 0
+            
+            self.x_error = 0.0
+            self.y_error = 0.0
+            self.z_error = 0.0
+            self.yaw_error = 0.0
 
-            if elapsed < self.hold_timeout:
-                self.aruco_id = self.prev_id
-                self.marker_x = self.prev_x
-                self.marker_y = self.prev_y
-                self.marker_z = self.prev_z
-                self.marker_yaw = self.prev_yaw
+            cv2.putText(frame, self.aruco_status_undetected, (100, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
+            cv2.putText(frame, self.aruco_status_undetected, (100, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
+            cv2.putText(frame, self.aruco_status_undetected, (100, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
+            cv2.putText(frame, self.aruco_status_undetected, (100, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
 
-            else:
-                self.aruco_id = 0
-                self.marker_x = 0.0
-                self.marker_y = 0.0
-                self.marker_z = 0.0
-                self.marker_yaw = 0.0
+            cv2.putText(frame, f"None",  (45,  self.frame_height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
+            cv2.putText(frame, f"None",  (145, self.frame_height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
+            cv2.putText(frame, f"None",  (245, self.frame_height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
 
-                self.x_error = 0.0
-                self.y_error = 0.0
-                self.z_error = 0.0
-                self.yaw_error = 0.0
+            cv2.putText(frame, f"None",  (35,  self.frame_height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
+            cv2.putText(frame, f"None",  (145, self.frame_height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
+            cv2.putText(frame, f"None",  (235, self.frame_height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
+                    
+        # control_signalx, control_signalz, control_signalyaw = self.PID.calculation(self.x_error, self.z_error, self.yaw_error)
+        # self.commandToSend = f'*10,{self.x_error},{self.y_error},{self.z_error},{control_signalx},{control_signalz},{control_signalyaw}#'
 
-        control_signalx, control_signalz, control_signalyaw = self.PID.calculation(self.x_error, self.z_error, self.yaw_error)
-        self.commandToSend = f'*10,{self.x_error},{self.y_error},{self.z_error},{control_signalx},{control_signalz},{control_signalyaw}#'
+        cv2.putText(frame, self.aruco_flag_name,   (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(frame, self.error_x_name,      (5, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(frame, self.error_y_name,      (5, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(frame, self.error_z_name,      (5, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
 
-        # cv2.putText(frame_RGB_copy, self.aruco_flag_name, (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
-        # cv2.putText(frame_RGB_copy, self.aruco_status_name, (5, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
-        # cv2.putText(frame_RGB_copy, self.error_x_name, (5, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
-        # cv2.putText(frame_RGB_copy, self.error_y_name, (5, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
-        # cv2.putText(frame_RGB_copy, self.error_z_name, (5, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
-        # cv2.putText(frame_RGB_copy, self.error_yaw_name, (5, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
+        cv2.putText(frame, str('Pos X:'),  (5,   self.frame_height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(frame, str('Pos Y:'),  (105, self.frame_height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(frame, str('Pos Z:'),  (205, self.frame_height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
 
-        cv2.putText(frame, str('FPS:'), (550,20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
-        
+        cv2.putText(frame, str('Roll:'),  (5,   self.frame_height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(frame, str('Pitch:'), (105, self.frame_height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(frame, str('Yaw:'),   (205, self.frame_height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
         
         # self.get_logger().info(f'ArUco Marker : ID_{self.aruco_id}, X = {self.marker_x:.3f}, Y = {self.marker_y:.3f}, Z = {self.marker_z:.3f}, Yaw = {self.marker_yaw:.3f}, command = {self.commandToSend}')
 
-        process_time = (time.perf_counter() - process_start) * 1000.0
-        self.processing_times["Total"] = process_time
+        # process_time = (time.perf_counter() - process_start) * 1000.0
+        # self.processing_times["Total"] = process_time
 
-        self.get_logger().info(
-            f"Frame: {self.processing_times.get('Frame', 0.0):.3f} ms | "
-            f"FPS Calc: {self.processing_times.get('FPS Calc', 0.0):.3f} ms | "
-            f"Gray: {self.processing_times.get('Gray', 0.0):.3f} ms | "
-            f"Aruco Detection: {self.processing_times.get('Aruco Detection', 0.0):.3f} ms | "
-            f"Marker Selection: {self.processing_times.get('Marker Selection', 0.0):.3f} ms | "
-            f"Pose Calculation: {self.processing_times.get('Pose Calculation', 0.0):.3f} ms | "
-            f"Error Calculation: {self.processing_times.get('Error Calculation', 0.0):.3f} ms | "
-            f"Drawing: {self.processing_times.get('Drawing', 0.0):.3f} ms | "
-            f"Total: {process_time:.3f} ms | "
-        )
+        # self.get_logger().info(
+        #     f"Frame: {self.processing_times.get('Frame', 0.0):.3f} ms | "
+        #     f"FPS Calc: {self.processing_times.get('FPS Calc', 0.0):.3f} ms | "
+        #     f"Gray: {self.processing_times.get('Gray', 0.0):.3f} ms | "
+        #     f"Aruco Detection: {self.processing_times.get('Aruco Detection', 0.0):.3f} ms | "
+        #     f"Marker Selection: {self.processing_times.get('Marker Selection', 0.0):.3f} ms | "
+        #     f"Pose Calculation: {self.processing_times.get('Pose Calculation', 0.0):.3f} ms | "
+        #     f"Error Calculation: {self.processing_times.get('Error Calculation', 0.0):.3f} ms | "
+        #     f"Drawing: {self.processing_times.get('Drawing', 0.0):.3f} ms | "
+        #     f"Total: {process_time:.3f} ms | "
+        # )
 
-        processing_fps = 1000.0 / process_time if process_time > 0 else 0.0
-        cv2.putText(frame, f"{processing_fps:.1f}", (590,20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
-        cv2.imshow("ArUco Marker Detection", frame)
+        # processing_fps = 1000.0 / process_time if process_time > 0 else 0.0
+        # cv2.putText(frame, f"{processing_fps:.1f}", (590,20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
+        cv2.imshow("Omnibot Marker Detection", frame)
         cv2.waitKey(1)
 
     def measure_time(self, name, start_time):
@@ -372,7 +298,7 @@ class object_tracking_aruco(Node):
             return
         
         try:
-            self.serial_to_robot.write(self.commandToSend.encode('ascii'))
+            self.serial_to_robot.write(self.commandToSend.encode())
         
         except (serial.SerialException, OSError) as e:
             self.get_logger().error(f"Serial Error! {e}")

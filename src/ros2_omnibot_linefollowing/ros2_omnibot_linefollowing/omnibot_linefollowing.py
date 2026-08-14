@@ -17,7 +17,7 @@ class linefollowing(Node):
 
         self.bridge_object = CvBridge()
         
-        self.sub_camera_topic_name = 'ros2_topic_camera'
+        self.sub_camera_topic_name = '/omnibot_camera'
         self.queue_size = 20
         self.subscriber_camera = self.create_subscription(Image, 
                                                           self.sub_camera_topic_name, 
@@ -111,10 +111,10 @@ class linefollowing(Node):
 
         self.get_logger().info(f"Error = {error}, PID = {control_signal}, Lin Speed = {self.lin_speed}, Ang Speed = {self.ang_speed}")
 
-        # cv2.imshow('[Subscriber] - Omnibot Camera', frame_RGB)
-        # cv2.imshow('[Subscriber] - Omnibot Gray', frame_gray)
-        # cv2.imshow('[Subscriber] - Omnibot Binary', frame_binary)
-        # cv2.imshow('[Subscriber] - Omnibot Detection', frame_contour_detection)
+        cv2.imshow('[Subscriber] - Omnibot Camera', frame_RGB)
+        cv2.imshow('[Subscriber] - Omnibot Gray', frame_gray)
+        cv2.imshow('[Subscriber] - Omnibot Binary', frame_binary)
+        cv2.imshow('[Subscriber] - Omnibot Detection', frame_contour_detection)
 
         cv2.waitKey(1)
 
@@ -146,8 +146,8 @@ class LineDetectorModule:
         roi_center_x = roi_frame_width // 2
         roi_center_y = roi_frame_height // 2
 
-        # cv2.rectangle(input_frame, (roi_left, roi_top), (roi_right, roi_bottom), (0,255,0), 1, cv2.LINE_AA)
-        # cv2.circle(input_frame, (roi_center_x, roi_center_y), 2, (0,255,0), 2, cv2.LINE_AA)
+        cv2.rectangle(input_frame, (roi_left, roi_top), (roi_right, roi_bottom), (0,255,0), 1, cv2.LINE_AA)
+        cv2.circle(input_frame, (roi_center_x, roi_center_y), 2, (0,255,0), 2, cv2.LINE_AA)
 
         gray_frame = cv2.cvtColor(roi_frame_copy, cv2.COLOR_BGR2GRAY)
         blur_frame = cv2.GaussianBlur(gray_frame, (7,7), 0)
@@ -239,14 +239,10 @@ class SerialCommunicationModule:
 def main(args=None):
     rclpy.init(args=args)
     subscriber_node = linefollowing()
-    try:
-        rclpy.spin(subscriber_node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        subscriber_node.destroy_node()
-        rclpy.shutdown()
-        subscriber_node.plot_pid_response()
+    rclpy.spin(subscriber_node)
+    subscriber_node.destroy_node()
+    rclpy.shutdown()
+    subscriber_node.plot_pid_response()
 
 if __name__ == '__main__':
     main()
